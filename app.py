@@ -6,11 +6,14 @@ from flask import Flask, jsonify, request, render_template_string
 app = Flask(__name__)
 
 LOCK = Lock()
-VISITANTES = {}  # Guarda as informações de quem acessou
+VISITANTES = {}
 MAX_REGISTROS = 1000
 
+# URL de destino padrão fornecida para a resposta
+URL_VERADDR_PADRAO = "http://2.25.132.119:2223/aalto/false/false/false/false/false/false/false/false/"
+
 def obter_ip_real():
-    """Captura o IP real considerando proxies e distribuidores de carga."""
+    """Captura o IP real considerando cabeçalhos de proxy do Render/Cloudflare."""
     for header in ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP"):
         valor = request.headers.get(header)
         if valor:
@@ -20,18 +23,16 @@ def obter_ip_real():
 def agora():
     return time.strftime("%d/%m/%Y %H:%M:%S")
 
-# Permite acesso CORS total sem restrições
 @app.after_request
-def aplicar_cors(response):
+def aplicar_cors_e_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
 
-# Captura os dados de todos os acessos antes de responder
 @app.before_request
 def registrar_acesso():
-    # Não registra nem intercepta acessos às rotas do admin
+    # Não registra acessos ao painel admin
     if request.path.startswith("/admin"):
         return None
 
@@ -55,7 +56,26 @@ def registrar_acesso():
     return None
 
 # -------------------------------------------------------------
-# 1. PAINEL ADMINISTRATIVO (PRIORIDADE ALTA)
+# ROTA PÚBLICA PARA O JOGO (/verAddr)
+# Responde sempre HTTP 200 com JSON limpo para evitar Erro 2
+# -------------------------------------------------------------
+@app.route("/verAddr", methods=["GET", "POST", "OPTIONS"])
+def gateway_ver_addr():
+    if request.method == "OPTIONS":
+        return "", 200
+
+    # Retorno estruturado no formato JSON esperado pelo parser de rede
+    resposta = {
+        "status": "sucesso",
+        "code": 200,
+        "verAddr": URL_VERADDR_PADRAO,
+        "ip": obter_ip_real()
+    }
+    
+    return jsonify(resposta), 200
+
+# -------------------------------------------------------------
+# PAINEL ADMINISTRATIVO (/admin)
 # -------------------------------------------------------------
 PAINEL_HTML = """
 <!DOCTYPE html>
@@ -74,7 +94,7 @@ PAINEL_HTML = """
     </style>
 </head>
 <body>
-    <h1>📊 IPs Conectados / Registrados ({{ visitantes|length }})</h1>
+    <h1>📊 IPs Registrados no Servidor ({{ visitantes|length }})</h1>
     
     <form action="/admin/limpar" method="POST" onsubmit="return confirm('Limpar histórico?')">
         <button type="submit" class="btn-limpar">LIMPAR REGISTROS</button>
@@ -85,10 +105,10 @@ PAINEL_HTML = """
         <tr>
             <th>Último Acesso</th>
             <th>Primeiro Acesso</th>
-            <th>IP do Usuário</th>
-            <th>Qtd. Requisições</th>
-            <th>Método / Rota</th>
-            <th>User-Agent / Origem</th>
+            <th>IP do Dispositivo</th>
+            <th>Acessos</th>
+            <th>Rota Acessada</th>
+            <th>User-Agent</th>
         </tr>
         {% for ip, v in visitantes %}
         <tr>
@@ -108,7 +128,7 @@ PAINEL_HTML = """
 </html>
 """
 
-@app.route("/admin", methods=["GET", "POST"])
+@app.route("/admin", methods=["GET"])
 def painel_admin():
     with LOCK:
         lista = sorted(VISITANTES.items(), key=lambda kv: kv[1]["ts"], reverse=True)
@@ -120,23 +140,9 @@ def limpar():
         VISITANTES.clear()
     return render_template_string('<script>window.location.href="/admin";</script>')
 
-# -------------------------------------------------------------
-# 2. ROTA LIBERADA PARA O JOGO / SCRIPT
-# -------------------------------------------------------------
-@app.route("/verAddr", methods=["GET", "POST", "OPTIONS"])
-def gateway_ver_addr():
-    if request.method == "OPTIONS":
-        return "", 200
-
-    return jsonify({
-        "status": "sucesso",
-        "verAddr": "http://2.25.132.119:2223/aalto/false/false/false/false/false/false/false/false/"
-    }), 200
-
-# Rota padrão para links inválidos
 @app.route("/", methods=["GET", "POST"])
 def index():
-    return jsonify({"status": "sucesso", "mensagem": "Servidor rodando"}), 200
+    return jsonify({"status": "online"}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
