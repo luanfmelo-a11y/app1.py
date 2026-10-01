@@ -1,1008 +1,251 @@
-import os
-import json
-import ipaddress
+from flask import Flask, jsonify, request, render_template_string, Response
 from functools import wraps
-
-from flask import (
-    Flask,
-    request,
-    jsonify,
-    Response,
-    render_template_string,
-    redirect,
-    url_for
-)
-
-from werkzeug.middleware.proxy_fix import ProxyFix
-
-
-# ============================================================
-# APP
-# ============================================================
+import time
 
 app = Flask(__name__)
 
-# IMPORTANTE PARA SERVIDORES ATRÁS DE PROXY
-# Ex.: Render, Railway, etc.
-app.wsgi_app = ProxyFix(
-    app.wsgi_app,
-    x_for=1,
-    x_proto=1,
-    x_host=1
-)
-
-
-# ============================================================
-# CONFIGURAÇÃO
-# ============================================================
-
-ADMIN_USER = os.environ.get(
-    "ADMIN_USER",
-    "daviwld"
-)
-
-ADMIN_PASS = os.environ.get(
-    "ADMIN_PASS",
-    "luan4520r"
-)
-
-PORT = int(
-    os.environ.get(
-        "PORT",
-        5000
-    )
-)
-
+# =============================================================
+# CONFIGURAÇÕES DE SEGURANÇA E MODO PROGRAMADOR
+# =============================================================
+ADMIN_USER = "admin"
+ADMIN_PASS = "daviwld"
+MASTER_KEY = "luan4520r"  # Use para liberar links rapidamente
 MAX_TENTATIVAS = 10
+# =============================================================
 
-ARQUIVO_APROVADOS = "aprovados.json"
-ARQUIVO_PENDENTES = "pendentes.json"
-ARQUIVO_BANIDOS = "banidos.json"
+# BANCO DE DADOS GLOBAL (Persistente durante o ciclo de processo)
+IPS_APROVADOS = set()
+PENDENTES_LOG = []
+IPS_BANIDOS = set()
+TENTATIVAS_ERRO_IP = {}
 
-
-# ============================================================
-# ARQUIVOS
-# ============================================================
-
-def carregar_json(arquivo, padrao):
-
+def obter_ip_real():
+    """Extrai com precisão o IP do jogador ignorando proxies do Render."""
     try:
+        headers_ip = ['X-Forwarded-For', 'X-Real-IP', 'CF-Connecting-IP']
+        for header in headers_ip:
+            valor = request.headers.get(header)
+            if valor:
+                return valor.split(',')[0].strip()
+        return request.remote_addr or "127.0.0.1"
+    except Exception:
+        return "127.0.0.1"
 
-        with open(
-            arquivo,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            return json.load(f)
-
-    except (
-        FileNotFoundError,
-        json.JSONDecodeError,
-        OSError
-    ):
-
-        return padrao
-
-
-def salvar_json(arquivo, dados):
-
-    try:
-
-        arquivo_temp = arquivo + ".tmp"
-
-        with open(
-            arquivo_temp,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            json.dump(
-                dados,
-                f,
-                ensure_ascii=False,
-                indent=2
-            )
-
-        os.replace(
-            arquivo_temp,
-            arquivo
-        )
-
-        return True
-
-    except OSError as e:
-
-        print(
-            f"[ERRO AO SALVAR] {arquivo}: {e}",
-            flush=True
-        )
-
-        return False
-
-
-# ============================================================
-# CARREGAMENTO
-# ============================================================
-
-IPS_APROVADOS = set(
-    carregar_json(
-        ARQUIVO_APROVADOS,
-        []
-    )
-)
-
-DISPOSITIVOS_PENDENTES = carregar_json(
-    ARQUIVO_PENDENTES,
-    {}
-)
-
-IPS_BANIDOS = set(
-    carregar_json(
-        ARQUIVO_BANIDOS,
-        []
-    )
-)
-
-TENTATIVAS_ERRO = {}
-
-
-# ============================================================
-# IP
-# ============================================================
-
-def ip_valido(ip):
-
-    try:
-
-        ipaddress.ip_address(ip)
-
-        return True
-
-    except ValueError:
-
-        return False
-
-
-def obter_ip():
-
-    """
-    Depois do ProxyFix, request.remote_addr
-    representa o IP encaminhado pelo proxy.
-
-    Em acesso direto, representa o IP da conexão.
-    """
-
-    ip = (
-        request.remote_addr
-        or ""
-    ).strip()
-
-    if ip and ip_valido(ip):
-
-        return ip
-
-    return "0.0.0.0"
-
-
-# ============================================================
-# CORS
-# ============================================================
-
+# LIBERAÇÃO DE CORS TOTAL PARA JOGOS / LUA / EXECUTÁVEIS
 @app.after_request
 def aplicar_cors(response):
-
-    response.headers[
-        "Access-Control-Allow-Origin"
-    ] = "*"
-
-    response.headers[
-        "Access-Control-Allow-Headers"
-    ] = "*"
-
-    response.headers[
-        "Access-Control-Allow-Methods"
-    ] = "GET, POST, OPTIONS"
-
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
     return response
 
-
-# ============================================================
-# BANIMENTO
-# ============================================================
-
 @app.before_request
-def verificar_banimento():
-
-    if request.method == "OPTIONS":
-
-        return None
-
-    ip = obter_ip()
-
+def verificar_ip_banido():
+    ip = obtaining_ip = obter_ip_real()
     if ip in IPS_BANIDOS:
+        return jsonify({"status": "bloqueado", "erro": "IP banido por segurança."}), 403
 
-        print(
-            f"[BLOQUEADO] {ip}",
-            flush=True
-        )
-
-        return Response(
-            status=404
-        )
-
-    return None
-
-
-# ============================================================
-# AUTENTICAÇÃO DO PAINEL
-# ============================================================
-
-def requer_admin(func):
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-
+def requer_autenticacao(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        ip = obter_ip_real()
         auth = request.authorization
 
-        ip = obter_ip()
-
-        if (
-            auth
-            and auth.username == ADMIN_USER
-            and auth.password == ADMIN_PASS
-        ):
-
-            TENTATIVAS_ERRO.pop(
-                ip,
-                None
-            )
-
-            return func(
-                *args,
-                **kwargs
-            )
+        if auth and auth.username == ADMIN_USER and auth.password == ADMIN_PASS:
+            TENTATIVAS_ERRO_IP.pop(ip, None)
+            return f(*args, **kwargs)
 
         if auth:
-
-            tentativas = (
-                TENTATIVAS_ERRO.get(
-                    ip,
-                    0
-                ) + 1
-            )
-
-            TENTATIVAS_ERRO[ip] = tentativas
-
-            if tentativas >= MAX_TENTATIVAS:
-
+            erros = TENTATIVAS_ERRO_IP.get(ip, 0) + 1
+            TENTATIVAS_ERRO_IP[ip] = erros
+            if erros >= MAX_TENTATIVAS:
                 IPS_BANIDOS.add(ip)
-
-                salvar_json(
-                    ARQUIVO_BANIDOS,
-                    sorted(IPS_BANIDOS)
-                )
-
-                return Response(
-                    status=404
-                )
+                return jsonify({"status": "banido", "mensagem": "IP banido."}), 403
 
         return Response(
-            "Authentication required",
-            401,
-            {
-                "WWW-Authenticate":
-                'Basic realm="Painel Admin"'
-            }
+            'Acesso negado. Credenciais invalidas.', 401,
+            {'WWW-Authenticate': 'Basic realm="Painel Restrito"'}
         )
+    return decorated
 
-    return wrapper
+# -------------------------------------------------------------
+# 1. API PÚBLICA (USADA PELO JOGO / SCRIPT)
+# -------------------------------------------------------------
+@app.route('/verAddr', methods=['GET', 'POST', 'OPTIONS', 'PUT'])
+def gateway_ver_addr():
+    if request.method == 'OPTIONS':
+        return '', 200
 
+    ip_cliente = obter_ip_real()
+    user_agent = request.headers.get('User-Agent', 'Desconhecido / Jogo')
 
-# ============================================================
-# REGISTRAR ACESSO
-# ============================================================
-
-def registrar_pendente(ip):
-
-    user_agent = request.headers.get(
-        "User-Agent",
-        "desconhecido"
-    )
-
-    # Guarda informações adicionais úteis
-    dados = {
-        "ip": ip,
-        "user_agent": user_agent,
-        "metodo": request.method,
-        "rota": request.path
+    # REGISTRA TENTATIVA DE ACESSO NO LOG GLOBAL DE PENDENTES
+    registro = {
+        "ip": ip_cliente,
+        "agent": user_agent,
+        "hora": time.strftime('%H:%M:%S')
     }
+    
+    # Adiciona se ainda não constar nos pendentes
+    if not any(item['ip'] == ip_cliente for item in PENDENTES_LOG):
+        PENDENTES_LOG.insert(0, registro)
+        if len(PENDENTES_LOG) > 50: # Mantém apenas os últimos 50
+            PENDENTES_LOG.pop()
 
-    DISPOSITIVOS_PENDENTES[ip] = dados
-
-    salvo = salvar_json(
-        ARQUIVO_PENDENTES,
-        DISPOSITIVOS_PENDENTES
-    )
-
-    print(
-        "==================================================",
-        flush=True
-    )
-
-    print(
-        "[NOVO ACESSO]",
-        flush=True
-    )
-
-    print(
-        f"IP: {ip}",
-        flush=True
-    )
-
-    print(
-        f"User-Agent: {user_agent}",
-        flush=True
-    )
-
-    print(
-        f"Rota: {request.path}",
-        flush=True
-    )
-
-    print(
-        f"Salvo: {salvo}",
-        flush=True
-    )
-
-    print(
-        "==================================================",
-        flush=True
-    )
-
-
-# ============================================================
-# /verAddr
-# ============================================================
-
-@app.route(
-    "/verAddr",
-    methods=[
-        "GET",
-        "POST",
-        "OPTIONS"
-    ]
-)
-def ver_addr():
-
-    # Preflight
-    if request.method == "OPTIONS":
-
-        return "", 204
-
-    ip = obter_ip()
-
-    print(
-        f"[VERADDR] requisição recebida de {ip}",
-        flush=True
-    )
-
-    # ========================================================
-    # APROVADO
-    # ========================================================
-
-    if ip in IPS_APROVADOS:
-
-        print(
-            f"[APROVADO] {ip}",
-            flush=True
-        )
-
+    # SE O IP JÁ TIVER SIDO APROVADO:
+    if ip_cliente in IPS_APROVADOS:
         return jsonify({
-
             "status": "sucesso",
-
-            "verAddr":
-                "http://2.25.132.119:2223/"
-                "aalto/false/false/false/false/"
-                "false/false/false/false/"
-
+            "verAddr": "http://2.25.132.119:2223/aalto/false/false/false/false/false/false/false/false/"
         }), 200
 
-    # ========================================================
-    # NÃO APROVADO
-    # ========================================================
-
-    registrar_pendente(ip)
-
-    # Sem JSON.
-    # Sem texto.
-    # Somente Not Found.
-    return Response(
-        status=404
-    )
-
-
-# ============================================================
-# PAINEL HTML
-# ============================================================
-
-PAINEL = """
-
-<!DOCTYPE html>
-
-<html lang="pt-br">
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta
-    name="viewport"
-    content="width=device-width,initial-scale=1"
->
-
-<title>Painel de Acessos</title>
-
-<style>
-
-body {
-
-    margin: 0;
-
-    padding: 25px;
-
-    font-family: Arial, sans-serif;
-
-    background: #101010;
-
-    color: white;
-
-}
-
-h1 {
-
-    margin-bottom: 10px;
-
-}
-
-h2 {
-
-    margin-top: 35px;
-
-}
-
-.info {
-
-    background: #1b1b1b;
-
-    padding: 15px;
-
-    border-radius: 8px;
-
-    margin-bottom: 20px;
-
-}
-
-table {
-
-    width: 100%;
-
-    border-collapse: collapse;
-
-    margin-top: 15px;
-
-}
-
-th,
-td {
-
-    border: 1px solid #333;
-
-    padding: 12px;
-
-    text-align: left;
-
-}
-
-th {
-
-    background: #242424;
-
-}
-
-td {
-
-    background: #181818;
-
-}
-
-code {
-
-    color: #00ff9d;
-
-}
-
-button,
-a {
-
-    display: inline-block;
-
-    padding: 8px 13px;
-
-    border-radius: 5px;
-
-    border: 0;
-
-    text-decoration: none;
-
-    color: white;
-
-    cursor: pointer;
-
-}
-
-.aprovar {
-
-    background: #1f9d55;
-
-}
-
-.revogar {
-
-    background: #d33;
-
-}
-
-form {
-
-    margin-top: 15px;
-
-}
-
-input {
-
-    padding: 10px;
-
-    background: #202020;
-
-    color: white;
-
-    border: 1px solid #444;
-
-    border-radius: 5px;
-
-}
-
-</style>
-
-</head>
-
-
-<body>
-
-
-<h1>Painel de Controle</h1>
-
-
-<div class="info">
-
-<strong>Seu IP:</strong>
-
-<code>
-{{ meu_ip }}
-</code>
-
-<br><br>
-
-<strong>Pendentes:</strong>
-
-{{ pendentes|length }}
-
-&nbsp;&nbsp;&nbsp;
-
-<strong>Aprovados:</strong>
-
-{{ aprovados|length }}
-
-</div>
-
-
-<h2>
-Acessos aguardando aprovação
-</h2>
-
-
-<table>
-
-<tr>
-
-<th>IP</th>
-
-<th>User-Agent / Dispositivo</th>
-
-<th>Rota</th>
-
-<th>Ação</th>
-
-</tr>
-
-
-{% for ip, dados in pendentes.items() %}
-
-<tr>
-
-<td>
-
-<code>
-{{ dados["ip"] }}
-</code>
-
-</td>
-
-
-<td>
-
-<code>
-{{ dados["user_agent"] }}
-</code>
-
-</td>
-
-
-<td>
-
-<code>
-{{ dados["rota"] }}
-</code>
-
-</td>
-
-
-<td>
-
-<a
-    class="aprovar"
-    href="{{ url_for('aprovar', ip=ip) }}"
->
-APROVAR
-</a>
-
-</td>
-
-</tr>
-
-
-{% else %}
-
-<tr>
-
-<td colspan="4">
-
-Nenhum acesso pendente.
-
-</td>
-
-</tr>
-
-{% endfor %}
-
-</table>
-
-
-<h2>
-Liberar IP manualmente
-</h2>
-
-
-<form
-    action="{{ url_for('aprovar_manual') }}"
-    method="POST"
->
-
-<input
-    type="text"
-    name="ip"
-    placeholder="Ex: 177.12.34.56"
-    required
->
-
-<button
-    class="aprovar"
-    type="submit"
->
-APROVAR
-</button>
-
-</form>
-
-
-<h2>
-IPs aprovados
-</h2>
-
-
-<table>
-
-<tr>
-
-<th>IP</th>
-
-<th>Ação</th>
-
-</tr>
-
-
-{% for ip in aprovados %}
-
-<tr>
-
-<td>
-
-<code>
-{{ ip }}
-</code>
-
-</td>
-
-<td>
-
-<a
-    class="revogar"
-    href="{{ url_for('revogar', ip=ip) }}"
->
-REVOGAR
-</a>
-
-</td>
-
-</tr>
-
-
-{% else %}
-
-<tr>
-
-<td colspan="2">
-
-Nenhum IP aprovado.
-
-</td>
-
-</tr>
-
-{% endfor %}
-
-</table>
-
-
-</body>
-
-</html>
-
-"""
-
-
-# ============================================================
-# ADMIN
-# ============================================================
-
-@app.route("/admin")
-@requer_admin
-def painel_admin():
-
-    return render_template_string(
-
-        PAINEL,
-
-        meu_ip=obter_ip(),
-
-        pendentes=DISPOSITIVOS_PENDENTES,
-
-        aprovados=sorted(
-            IPS_APROVADOS
-        )
-
-    )
-
-
-# ============================================================
-# APROVAR
-# ============================================================
-
-@app.route("/admin/aprovar")
-@requer_admin
-def aprovar():
-
-    ip = request.args.get(
-        "ip",
-        ""
-    ).strip()
-
-    if not ip_valido(ip):
-
-        return redirect(
-            url_for("painel_admin")
-        )
+    # SE NÃO ESTIVER APROVADO:
+    return jsonify({
+        "status": "pendente",
+        "seu_ip": ip_cliente,
+        "mensagem": f"IP {ip_cliente} aguardando aprovacao.",
+        "link_liberacao_rapida": f"{request.host_url}master/liberar?key={MASTER_KEY}&ip={ip_cliente}"
+    }), 403
+
+
+# -------------------------------------------------------------
+# 2. ROTA MESTRA DO PROGRAMADOR (LIBERAÇÃO DIRETA VIA URL/LINK)
+# -------------------------------------------------------------
+@app.route('/master/liberar', methods=['GET'])
+def master_liberar():
+    chave = request.args.get('key')
+    ip = request.args.get('ip')
+
+    if chave != MASTER_KEY:
+        return jsonify({"status": "erro", "mensagem": "Chave mestra incorreta."}), 401
+
+    if not ip:
+        ip = obter_ip_real()
 
     IPS_APROVADOS.add(ip)
+    
+    # Remove do log de pendentes
+    global PENDENTES_LOG
+    PENDENTES_LOG = [item for item in PENDENTES_LOG if item['ip'] != ip]
 
-    DISPOSITIVOS_PENDENTES.pop(
-        ip,
-        None
+    return f"""
+    <div style="background: #121212; color: #00ff00; font-family: monospace; padding: 30px; text-align: center; font-size: 20px;">
+        ✅ <strong>SUCESSO!</strong><br><br>
+        O IP <u>{ip}</u> foi LIBERADO COM SUCESSO no sistema.<br>
+        O jogo / script já pode acessar normalmente.
+    </div>
+    """
+
+
+# -------------------------------------------------------------
+# 3. PAINEL ADMINISTRATIVO COMPLETO
+# -------------------------------------------------------------
+PAINEL_HTML = """
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel Mestre - verAddr</title>
+    <style>
+        body { font-family: monospace; background: #0e0e10; color: #e1e1e6; padding: 20px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; margin-bottom: 30px; background: #18181b; }
+        th, td { border: 1px solid #27272a; padding: 12px; text-align: left; }
+        th { background: #27272a; color: #a1a1aa; }
+        .btn { padding: 8px 16px; border-radius: 4px; text-decoration: none; font-weight: bold; display: inline-block; }
+        .btn-green { background: #22c55e; color: #000; }
+        .btn-red { background: #ef4444; color: #fff; }
+        .card { background: #18181b; border: 1px solid #27272a; padding: 20px; border-radius: 8px; margin-bottom: 25px; }
+        input[type="text"] { padding: 10px; width: 280px; border-radius: 4px; border: 1px solid #3f3f46; background: #09090b; color: #fff; }
+        button { padding: 10px 18px; background: #6366f1; color: #fff; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>🛠️ Painel de Controle Definitivo</h1>
+
+    <div class="card">
+        <h3>⚡ Liberar Qualquer IP Manualmente</h3>
+        <form action="/admin/aprovar_manual" method="GET">
+            <input type="text" name="ip" placeholder="Digite o IP (Ex: 189.10.20.30)" required>
+            <button type="submit">LIBERAR AGORA</button>
+        </form>
+    </div>
+
+    <h2>⏳ Últimas Requisições Detectadas (Pendentes)</h2>
+    <table>
+        <tr>
+            <th>Horário</th>
+            <th>IP Solicitante</th>
+            <th>Origem / User-Agent</th>
+            <th>Ação</th>
+        </tr>
+        {% for item in pendentes %}
+        <tr>
+            <td>{{ item.hora }}</td>
+            <td><code>{{ item.ip }}</code></td>
+            <td><code>{{ item.agent }}</code></td>
+            <td><a href="/admin/aprovar?ip={{ item.ip }}" class="btn btn-green">APROVAR IP</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4">Nenhuma requisição pendente registrada até o momento.</td></tr>
+        {% endfor %}
+    </table>
+
+    <h2>✅ IPs Aprovados Atualmente</h2>
+    <table>
+        <tr>
+            <th>IP Liberado</th>
+            <th>Ação</th>
+        </tr>
+        {% for ip in aprovados %}
+        <tr>
+            <td><code>{{ ip }}</code></td>
+            <td><a href="/admin/revogar?ip={{ ip }}" class="btn btn-red">REVOGAR / BLOQUEAR</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="2">Nenhum IP aprovado.</td></tr>
+        {% endfor %}
+    </table>
+</body>
+</html>
+"""
+
+@app.route('/admin')
+@requer_autenticacao
+def painel_admin():
+    return render_template_string(
+        PAINEL_HTML,
+        pendentes=PENDENTES_LOG,
+        aprovados=IPS_APROVADOS
     )
 
-    save_ok_1 = salvar_json(
-        ARQUIVO_APROVADOS,
-        sorted(IPS_APROVADOS)
-    )
-
-    save_ok_2 = salvar_json(
-        ARQUIVO_PENDENTES,
-        DISPOSITIVOS_PENDENTES
-    )
-
-    print(
-        f"[ADMIN] IP aprovado: {ip}",
-        flush=True
-    )
-
-    print(
-        f"[ADMIN] aprovados.json: {save_ok_1}",
-        flush=True
-    )
-
-    print(
-        f"[ADMIN] pendentes.json: {save_ok_2}",
-        flush=True
-    )
-
-    return redirect(
-        url_for("painel_admin")
-    )
-
-
-# ============================================================
-# APROVAR MANUALMENTE
-# ============================================================
-
-@app.route(
-    "/admin/aprovar_manual",
-    methods=["POST"]
-)
-@requer_admin
-def aprovar_manual():
-
-    ip = request.form.get(
-        "ip",
-        ""
-    ).strip()
-
-    if ip_valido(ip):
-
+@app.route('/admin/aprovar')
+@requer_autenticacao
+def aprovar():
+    ip = request.args.get('ip')
+    if ip:
         IPS_APROVADOS.add(ip)
+        global PENDENTES_LOG
+        PENDENTES_LOG = [item for item in PENDENTES_LOG if item['ip'] != ip]
+    return '<script>window.location.href="/admin";</script>'
 
-        DISPOSITIVOS_PENDENTES.pop(
-            ip,
-            None
-        )
+@app.route('/admin/aprovar_manual')
+@requer_autenticacao
+def aprovar_manual():
+    ip = request.args.get('ip', '').strip()
+    if ip:
+        IPS_APROVADOS.add(ip)
+        global PENDENTES_LOG
+        PENDENTES_LOG = [item for item in PENDENTES_LOG if item['ip'] != ip]
+    return '<script>window.location.href="/admin";</script>'
 
-        salvar_json(
-            ARQUIVO_APROVADOS,
-            sorted(IPS_APROVADOS)
-        )
-
-        salvar_json(
-            ARQUIVO_PENDENTES,
-            DISPOSITIVOS_PENDENTES
-        )
-
-        print(
-            f"[ADMIN] IP aprovado manualmente: {ip}",
-            flush=True
-        )
-
-    return redirect(
-        url_for("painel_admin")
-    )
-
-
-# ============================================================
-# REVOGAR
-# ============================================================
-
-@app.route("/admin/revogar")
-@requer_admin
+@app.route('/admin/revogar')
+@requer_autenticacao
 def revogar():
-
-    ip = request.args.get(
-        "ip",
-        ""
-    ).strip()
-
-    if ip in IPS_APROVADOS:
-
+    ip = request.args.get('ip')
+    if ip and ip in IPS_APROVADOS:
         IPS_APROVADOS.remove(ip)
+    return '<script>window.location.href="/admin";</script>'
 
-        salvar_json(
-            ARQUIVO_APROVADOS,
-            sorted(IPS_APROVADOS)
-        )
-
-        print(
-            f"[ADMIN] IP revogado: {ip}",
-            flush=True
-        )
-
-    return redirect(
-        url_for("painel_admin")
-    )
-
-
-# ============================================================
-# ROTA DE TESTE DO SERVIDOR
-# ============================================================
-
-@app.route("/status")
-def status():
-
-    return jsonify({
-        "online": True
-    })
-
-
-# ============================================================
-# QUALQUER OUTRA ROTA
-# ============================================================
-
-@app.errorhandler(404)
-def pagina_nao_encontrada(error):
-
-    # Retorna somente 404,
-    # sem mensagem personalizada.
-    return Response(
-        status=404
-    )
-
-
-# ============================================================
-# INICIAR
-# ============================================================
-
-if __name__ == "__main__":
-
-    print(
-        "==========================================",
-        flush=True
-    )
-
-    print(
-        "SERVIDOR INICIADO",
-        flush=True
-    )
-
-    print(
-        f"PORTA: {PORT}",
-        flush=True
-    )
-
-    print(
-        "API: /verAddr",
-        flush=True
-    )
-
-    print(
-        "PAINEL: /admin",
-        flush=True
-    )
-
-    print(
-        "==========================================",
-        flush=True
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        debug=False
-    )
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
