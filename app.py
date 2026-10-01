@@ -4,31 +4,81 @@ from functools import wraps
 app = Flask(__name__)
 
 # =============================================================
-# CONFIGURAÇÕES DE SEGURANÇA (ALTERA AQUI OS TEUS DADOS)
+# CONFIGURAÇÕES DE SEGURANÇA (ALTERE AQUI OS SEUS DADOS)
 # =============================================================
-ADMIN_USER = "daviwld"            # O teu nome de utilizador
-ADMIN_PASS = "luan4520r" # A tua palavra-passe secreta
+ADMIN_USER = "daviwld"            # Seu nome de usuário
+ADMIN_PASS = "luan4520r" # Sua senha secreta
+MAX_TENTATIVAS = 10             # Limite de erros antes do banimento
 # =============================================================
 
-# --- LISTAS DE AUTORIZAÇÃO (Em memória) ---
+# --- BANCO DE DADOS EM MEMÓRIA ---
 DISPOSITIVOS_APROVADOS = set()
 DISPOSITIVOS_PENDENTES = {}
 
+# Segurança e Banimento
+IPS_BANIDOS = set()
+TENTATIVAS_ERRO_IP = {}  # Formato: {"ip": quantidade_de_erros}
+
+
+# --- MIDDLEWARE / VERIFICAÇÃO DE BANIMENTO ---
+@app.before_request
+def verificar_ip_banido():
+    """Executado antes de qualquer requisição. Bloqueia IPs banidos imediatamente."""
+    ip_cliente = request.headers.get('X-Forwarded-For', request.remote_addr)
+    if ip_cliente:
+        # Pega o primeiro IP caso haja múltiplos no X-Forwarded-For
+        ip_cliente = ip_cliente.split(',')[0].strip()
+
+    if ip_cliente in IPS_BANIDOS:
+        return jsonify({
+            "status": "bloqueado",
+            "mensagem": "Seu IP foi permanentemente banido por excesso de tentativas incorretas."
+        }), 403
+
+
+# --- DECORATOR DE AUTENTICAÇÃO COM CONTADOR DE ERROS ---
 def requer_autenticacao(f):
-    """Decorator para proteger rotas com utilizador e palavra-passe."""
+    """Protege rotas com usuário/senha e aplica banimento após 10 erros."""
     @wraps(f)
     def decorated(*args, **kwargs):
+        ip_cliente = request.headers.get('X-Forwarded-For', request.remote_addr)
+        if ip_cliente:
+            ip_cliente = ip_cliente.split(',')[0].strip()
+
         auth = request.authorization
-        if not auth or not (auth.username == ADMIN_USER and auth.password == ADMIN_PASS):
-            return Response(
-                'Acesso negado. Credenciais invalidas.', 401,
-                {'WWW-Authenticate': 'Basic realm="Acesso Restrito ao Administrador"'}
-            )
-        return f(*args, **kwargs)
+
+        # Se as credenciais estiverem corretas: zera o contador de erros do IP e libera
+        if auth and auth.username == ADMIN_USER and auth.password == ADMIN_PASS:
+            TENTATIVAS_ERRO_IP.pop(ip_cliente, None)
+            return f(*args, **kwargs)
+
+        # Se errou a senha ou não enviou credenciais:
+        # Registra a tentativa com falha apenas se houver tentativa de auth
+        if auth:
+            erros_atuais = TENTATIVAS_ERRO_IP.get(ip_cliente, 0) + 1
+            TENTATIVAS_ERRO_IP[ip_cliente] = erros_atuais
+
+            print(f"[ALERTA SEGURANÇA] Tentativa incorreta de login do IP: {ip_cliente} ({erros_atuais}/{MAX_TENTATIVAS})")
+
+            # Se atingiu ou passou de 10 erros, bane o IP
+            if erros_atuais >= MAX_TENTATIVAS:
+                IPS_BANIDOS.add(ip_cliente)
+                print(f"[BANIMENTO] IP BANIDO POR EXCESSO DE TENTATIVAS: {ip_cliente}")
+                return jsonify({
+                    "status": "banido",
+                    "mensagem": "IP banido por excesso de tentativas de login incorretas."
+                }), 403
+
+        # Solicita login e senha via browser
+        return Response(
+            'Acesso negado. Credenciais invalidas.', 401,
+            {'WWW-Authenticate': 'Basic realm="Acesso Restrito ao Administrador"'}
+        )
     return decorated
 
+
 # -------------------------------------------------------------
-# 1. API PÚBLICA (Para o jogo/script aceder)
+# 1. API PÚBLICA (Para o jogo/script acessar)
 # -------------------------------------------------------------
 @app.route('/verAddr', methods=['GET', 'POST'])
 def gateway_ver_addr():
@@ -42,7 +92,7 @@ def gateway_ver_addr():
             "verAddr": "http://2.25.132.119:2223/aalto/false/false/false/false/false/false/false/false/"
         }), 200
 
-    # Se não estiver aprovado: regista na lista de pendentes e bloqueia
+    # Se não estiver aprovado: registra na lista de pendentes e bloqueia
     DISPOSITIVOS_PENDENTES[id_dispositivo] = {
         "ip": ip_cliente,
         "user_agent": user_agent
@@ -71,6 +121,8 @@ PAINEL_HTML = """
         .btn { padding: 6px 12px; border-radius: 4px; text-decoration: none; color: #fff; font-weight: bold; }
         .btn-aprovar { background: #28a745; }
         .btn-revogar { background: #dc3545; }
+        .btn-desbanir { background: #ffc107; color: #000; }
+        .card-banidos { border: 1px solid #dc3545; padding: 15px; margin-top: 20px; border-radius: 6px; }
     </style>
 </head>
 <body>
@@ -109,6 +161,24 @@ PAINEL_HTML = """
         <tr><td colspan="2">Nenhum dispositivo aprovado.</td></tr>
         {% endfor %}
     </table>
+
+    <div class="card-banidos">
+        <h2>IPs Banidos por Tentativas Incorretas</h2>
+        <table>
+            <tr>
+                <th>Endereço IP Banido</th>
+                <th>Ação</th>
+            </tr>
+            {% for ip in banidos %}
+            <tr>
+                <td><code>{{ ip }}</code></td>
+                <td><a href="/admin/desbanir?ip={{ ip }}" class="btn btn-desbanir">Desbanir IP</a></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="2">Nenhum IP banido até o momento.</td></tr>
+            {% endfor %}
+        </table>
+    </div>
 </body>
 </html>
 """
@@ -116,7 +186,12 @@ PAINEL_HTML = """
 @app.route('/admin')
 @requer_autenticacao
 def painel_admin():
-    return render_template_string(PAINEL_HTML, pendentes=DISPOSITIVOS_PENDENTES, aprovados=DISPOSITIVOS_APROVADOS)
+    return render_template_string(
+        PAINEL_HTML, 
+        pendentes=DISPOSITIVOS_PENDENTES, 
+        aprovados=DISPOSITIVOS_APROVADOS,
+        banidos=IPS_BANIDOS
+    )
 
 @app.route('/admin/aprovar')
 @requer_autenticacao
@@ -133,6 +208,15 @@ def revogar():
     dispositivo_id = request.args.get('id')
     if dispositivo_id and dispositivo_id in DISPOSITIVOS_APROVADOS:
         DISPOSITIVOS_APROVADOS.remove(dispositivo_id)
+    return '<script>window.location.href="/admin";</script>'
+
+@app.route('/admin/desbanir')
+@requer_autenticacao
+def desbanir():
+    ip = request.args.get('ip')
+    if ip and ip in IPS_BANIDOS:
+        IPS_BANIDOS.remove(ip)
+        TENTATIVAS_ERRO_IP.pop(ip, None)
     return '<script>window.location.href="/admin";</script>'
 
 if __name__ == '__main__':
