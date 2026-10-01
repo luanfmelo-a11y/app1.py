@@ -2,237 +2,201 @@ import os
 import json
 import ipaddress
 from functools import wraps
-
-from flask import (
-    Flask,
-    jsonify,
-    request,
-    render_template_string,
-    Response,
-    redirect,
-    url_for
-)
+from flask import Flask, request, jsonify, Response, render_template_string, redirect, url_for
 
 app = Flask(__name__)
 
-# =============================================================
-# CONFIGURAÇÕES
-# =============================================================
-
 ADMIN_USER = os.environ.get("ADMIN_USER", "daviwld")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "luan4520r")
+PORT = int(os.environ.get("PORT", 5000))
 
-MAX_TENTATIVAS = 10
+APPROVED_FILE = "aprovados.json"
+PENDING_FILE = "pendentes.json"
+BANNED_FILE = "banidos.json"
 
-ARQUIVO_APROVADOS = "aprovados.json"
-ARQUIVO_PENDENTES = "pendentes.json"
-ARQUIVO_BANIDOS = "banidos.json"
 
-# =============================================================
-# FUNÇÕES DE ARQUIVO
-# =============================================================
-
-def carregar_json(arquivo, padrao):
-    if not os.path.exists(arquivo):
-        return padrao
-
+def load_json(path, default):
     try:
-        with open(arquivo, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return padrao
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
 
 
-def salvar_json(arquivo, dados):
-    try:
-        with open(arquivo, "w", encoding="utf-8") as f:
-            json.dump(dados, f, indent=2, ensure_ascii=False)
-        return True
-    except OSError as e:
-        print(f"Erro ao salvar {arquivo}: {e}")
-        return False
+def save_json(path, value):
+    tmp = path + ".tmp"
 
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=False, indent=2)
 
-# =============================================================
-# DADOS
-# =============================================================
+    os.replace(tmp, path)
+
 
 IPS_APROVADOS = set(
-    carregar_json(ARQUIVO_APROVADOS, [])
+    load_json(APPROVED_FILE, [])
 )
 
-DISPOSITIVOS_PENDENTES = carregar_json(
-    ARQUIVO_PENDENTES, {}
+DISPOSITIVOS_PENDENTES = load_json(
+    PENDING_FILE, {}
 )
 
 IPS_BANIDOS = set(
-    carregar_json(ARQUIVO_BANIDOS, [])
+    load_json(BANNED_FILE, [])
 )
 
-TENTATIVAS_ERRO_IP = {}
+TENTATIVAS = {}
 
 
-# =============================================================
-# IP
-# =============================================================
-
-def obter_ip_real():
-    """
-    Obtém o IP da conexão.
-
-    ATENÇÃO:
-    X-Forwarded-For só deve ser confiado quando vier
-    de um proxy reverso que você controla.
-    """
-
-    # Se estiver usando um proxy confiável,
-    # você pode habilitar esta opção.
-    proxy_ip = request.headers.get("X-Real-IP")
-
-    if proxy_ip:
-        ip = proxy_ip.strip()
-    else:
-        ip = request.remote_addr
-
-    if not ip:
-        return "0.0.0.0"
-
-    # Validação
+def valid_ip(value):
     try:
-        ipaddress.ip_address(ip)
-        return ip
-    except ValueError:
-        return "0.0.0.0"
-
-
-def ip_valido(ip):
-    try:
-        ipaddress.ip_address(ip)
+        ipaddress.ip_address(value)
         return True
     except ValueError:
         return False
 
 
-# =============================================================
-# CORS
-# =============================================================
+def get_client_ip():
+
+    xff = request.headers.get(
+        "X-Forwarded-For",
+        ""
+    )
+
+    if xff:
+
+        candidate = xff.split(",")[0].strip()
+
+        if valid_ip(candidate):
+            return candidate
+
+    xreal = request.headers.get(
+        "X-Real-IP",
+        ""
+    ).strip()
+
+    if valid_ip(xreal):
+        return xreal
+
+    remote = (
+        request.remote_addr or ""
+    ).strip()
+
+    if valid_ip(remote):
+        return remote
+
+    return "0.0.0.0"
+
 
 @app.after_request
-def aplicar_cors(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+def cors(response):
+
+    response.headers[
+        "Access-Control-Allow-Origin"
+    ] = "*"
+
+    response.headers[
+        "Access-Control-Allow-Headers"
+    ] = "*"
+
+    response.headers[
+        "Access-Control-Allow-Methods"
+    ] = "GET, POST, OPTIONS"
 
     return response
 
 
-# =============================================================
-# VERIFICAR IP BANIDO
-# =============================================================
-
 @app.before_request
-def verificar_ip_banido():
+def block_banned():
 
-    # Não bloqueia OPTIONS
     if request.method == "OPTIONS":
         return None
 
-    ip = obter_ip_real()
+    ip = get_client_ip()
 
     if ip in IPS_BANIDOS:
-        return jsonify({
-            "status": "bloqueado",
-            "mensagem": "IP banido."
-        }), 403
+        return Response(status=404)
 
     return None
 
 
-# =============================================================
-# AUTENTICAÇÃO ADMIN
-# =============================================================
+def admin_auth(fn):
 
-def requer_autenticacao(f):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
 
-    @wraps(f)
-    def decorated(*args, **kwargs):
-
-        ip = obter_ip_real()
         auth = request.authorization
+        ip = get_client_ip()
 
         if (
             auth
             and auth.username == ADMIN_USER
             and auth.password == ADMIN_PASS
         ):
-            TENTATIVAS_ERRO_IP.pop(ip, None)
 
-            return f(*args, **kwargs)
+            TENTATIVAS.pop(ip, None)
+
+            return fn(*args, **kwargs)
 
         if auth:
 
-            erros = TENTATIVAS_ERRO_IP.get(ip, 0) + 1
-            TENTATIVAS_ERRO_IP[ip] = erros
+            TENTATIVAS[ip] = (
+                TENTATIVAS.get(ip, 0) + 1
+            )
 
-            if erros >= MAX_TENTATIVAS:
+            if TENTATIVAS[ip] >= 10:
 
                 IPS_BANIDOS.add(ip)
-                salvar_json(
-                    ARQUIVO_BANIDOS,
-                    list(IPS_BANIDOS)
+
+                save_json(
+                    BANNED_FILE,
+                    sorted(IPS_BANIDOS)
                 )
 
-                return jsonify({
-                    "status": "banido",
-                    "mensagem": "IP banido por excesso de tentativas."
-                }), 403
+                return Response(status=404)
 
         return Response(
-            "Acesso negado. Credenciais invalidas.",
+            "Authentication required",
             401,
             {
                 "WWW-Authenticate":
-                'Basic realm="Painel Restrito"'
+                'Basic realm="Painel"'
             }
         )
 
-    return decorated
+    return wrapper
 
 
-# =============================================================
-# API /verAddr
-# =============================================================
+# ============================================================
+# API PRINCIPAL
+# ============================================================
 
 @app.route(
     "/verAddr",
     methods=["GET", "POST", "OPTIONS"]
 )
-def gateway_ver_addr():
+def ver_addr():
 
     if request.method == "OPTIONS":
-        return "", 200
+        return "", 204
 
-    ip_cliente = obter_ip_real()
+    ip = get_client_ip()
 
     user_agent = request.headers.get(
         "User-Agent",
-        "Desconhecido"
+        "desconhecido"
     )
 
     print(
-        f"[VERADDR] IP={ip_cliente} "
-        f"USER_AGENT={user_agent}"
+        f"[verAddr] IP={ip} "
+        f"UA={user_agent}",
+        flush=True
     )
 
-    # ---------------------------------------------------------
-    # IP APROVADO
-    # ---------------------------------------------------------
+    # ========================================================
+    # IP JÁ APROVADO
+    # ========================================================
 
-    if ip_cliente in IPS_APROVADOS:
-
-        print(
-            f"[APROVADO] {ip_cliente}"
-        )
+    if ip in IPS_APROVADOS:
 
         return jsonify({
             "status": "sucesso",
@@ -242,74 +206,66 @@ def gateway_ver_addr():
                 "false/false/false/false/"
         }), 200
 
-    # ---------------------------------------------------------
+    # ========================================================
     # IP NÃO APROVADO
-    # ---------------------------------------------------------
+    # ========================================================
 
-    DISPOSITIVOS_PENDENTES[ip_cliente] = {
-        "ip": ip_cliente,
+    DISPOSITIVOS_PENDENTES[ip] = {
+        "ip": ip,
         "user_agent": user_agent
     }
 
-    salvar_json(
-        ARQUIVO_PENDENTES,
+    save_json(
+        PENDING_FILE,
         DISPOSITIVOS_PENDENTES
     )
 
     print(
-        f"[PENDENTE] Novo acesso: {ip_cliente}"
+        f"[pendente] {ip}",
+        flush=True
     )
 
-    return jsonify({
-        "status": "erro",
-        "ip_detectado": ip_cliente,
-        "mensagem":
-            f"Acesso pendente de autorizacao "
-            f"para o IP: {ip_cliente}"
-    }), 403
+    # Sem mensagem, exatamente como solicitado.
+    return Response(status=404)
 
 
-# =============================================================
-# PAINEL
-# =============================================================
+# ============================================================
+# HTML DO PAINEL
+# ============================================================
 
-PAINEL_HTML = """
-<!DOCTYPE html>
+HTML = """
+<!doctype html>
 
 <html lang="pt-br">
 
 <head>
 
-<meta charset="UTF-8">
+<meta charset="utf-8">
 
 <meta
     name="viewport"
-    content="width=device-width, initial-scale=1.0"
+    content="width=device-width,initial-scale=1"
 >
 
-<title>Painel Admin</title>
+<title>Painel</title>
 
 <style>
 
 body {
-    font-family: Arial, sans-serif;
+    font-family: Arial;
     background: #121212;
-    color: white;
+    color: #fff;
     padding: 20px;
-}
-
-h1, h2 {
-    color: white;
 }
 
 table {
     width: 100%;
     border-collapse: collapse;
-    margin-top: 10px;
-    margin-bottom: 30px;
+    margin: 15px 0 30px;
 }
 
-th, td {
+th,
+td {
     border: 1px solid #333;
     padding: 10px;
     text-align: left;
@@ -323,59 +279,29 @@ td {
     background: #181818;
 }
 
-.btn {
-    padding: 8px 14px;
+a,
+button {
+    padding: 8px 12px;
+    border: 0;
     border-radius: 4px;
+    color: #fff;
     text-decoration: none;
-    color: white;
-    font-weight: bold;
-    display: inline-block;
+    cursor: pointer;
 }
 
-.btn-aprovar {
+.ap {
     background: #28a745;
 }
 
-.btn-revogar {
+.rv {
     background: #dc3545;
 }
 
-.btn-banir {
-    background: #6f42c1;
-}
-
-.btn-manual {
-    background: #007bff;
-    border: none;
-    padding: 8px 14px;
-    color: white;
-    font-weight: bold;
-    cursor: pointer;
-    border-radius: 4px;
-}
-
-input[type="text"] {
+input {
     padding: 8px;
-    width: 250px;
-    border-radius: 4px;
-    border: 1px solid #444;
     background: #222;
-    color: white;
-}
-
-.box-manual {
-    background: #1e1e1e;
-    padding: 15px;
-    border-radius: 6px;
-    margin-bottom: 30px;
-    border: 1px solid #333;
-}
-
-.status {
-    background: #1e1e1e;
-    padding: 12px;
-    border-radius: 5px;
-    margin-bottom: 20px;
+    color: #fff;
+    border: 1px solid #444;
 }
 
 code {
@@ -388,94 +314,42 @@ code {
 
 <body>
 
-<h1>Painel de Controle</h1>
+<h1>Painel de acessos</h1>
 
-<div class="status">
+<p>
+Seu IP:
+<code>{{ myip }}</code>
+</p>
 
-<strong>Seu IP:</strong>
-
-<code>{{ seu_ip }}</code>
-
-<br><br>
-
-<strong>Pendentes:</strong>
-{{ pendentes|length }}
-
-&nbsp;&nbsp;
-
-<strong>Aprovados:</strong>
-{{ aprovados|length }}
-
-</div>
-
-
-<!-- =====================================================
-LIBERAÇÃO MANUAL
-===================================================== -->
-
-<div class="box-manual">
-
-<h3>⚡ Liberar IP Manualmente</h3>
-
-<form
-    action="/admin/aprovar_manual"
-    method="POST"
->
-
-<input
-    type="text"
-    name="ip"
-    placeholder="Ex: 177.12.34.56"
-    required
->
-
-<button
-    type="submit"
-    class="btn-manual"
->
-Liberar IP
-</button>
-
-</form>
-
-</div>
-
-
-<!-- =====================================================
-PENDENTES
-===================================================== -->
-
-<h2>⏳ Acessos Pendentes</h2>
+<h2>
+Pendentes ({{ pending|length }})
+</h2>
 
 <table>
 
 <tr>
-
 <th>IP</th>
-
-<th>Dispositivo / User-Agent</th>
-
+<th>User-Agent / dispositivo</th>
 <th>Ação</th>
-
 </tr>
 
-{% for ip, info in pendentes.items() %}
+{% for ip, info in pending.items() %}
 
 <tr>
 
 <td>
-<code>{{ info.ip }}</code>
+<code>{{ info["ip"] }}</code>
 </td>
 
 <td>
-<code>{{ info.user_agent }}</code>
+<code>{{ info["user_agent"] }}</code>
 </td>
 
 <td>
 
 <a
-    href="/admin/aprovar?ip={{ ip }}"
-    class="btn btn-aprovar"
+    class="ap"
+    href="{{ url_for('approve', ip=ip) }}"
 >
 APROVAR
 </a>
@@ -499,23 +373,43 @@ Nenhum acesso pendente.
 </table>
 
 
-<!-- =====================================================
-APROVADOS
-===================================================== -->
+<h2>
+Aprovar manualmente
+</h2>
 
-<h2>✅ IPs Aprovados</h2>
+<form
+    action="{{ url_for('approve_manual') }}"
+    method="post"
+>
+
+<input
+    name="ip"
+    placeholder="IP"
+    required
+>
+
+<button
+    class="ap"
+    type="submit"
+>
+APROVAR
+</button>
+
+</form>
+
+
+<h2>
+Aprovados ({{ approved|length }})
+</h2>
 
 <table>
 
 <tr>
-
 <th>IP</th>
-
 <th>Ação</th>
-
 </tr>
 
-{% for ip in aprovados %}
+{% for ip in approved %}
 
 <tr>
 
@@ -526,8 +420,8 @@ APROVADOS
 <td>
 
 <a
-    href="/admin/revogar?ip={{ ip }}"
-    class="btn btn-revogar"
+    class="rv"
+    href="{{ url_for('revoke', ip=ip) }}"
 >
 REVOGAR
 </a>
@@ -550,40 +444,42 @@ Nenhum IP aprovado.
 
 </table>
 
-
 </body>
 
 </html>
 """
 
 
-# =============================================================
-# ROTA ADMIN
-# =============================================================
+# ============================================================
+# PAINEL
+# ============================================================
 
 @app.route("/admin")
-@requer_autenticacao
-def painel_admin():
+@admin_auth
+def admin():
 
     return render_template_string(
-        PAINEL_HTML,
-        pendentes=DISPOSITIVOS_PENDENTES,
-        aprovados=sorted(IPS_APROVADOS),
-        seu_ip=obter_ip_real()
+        HTML,
+        myip=get_client_ip(),
+        pending=DISPOSITIVOS_PENDENTES,
+        approved=sorted(IPS_APROVADOS)
     )
 
 
-# =============================================================
-# APROVAR IP
-# =============================================================
+# ============================================================
+# APROVAR
+# ============================================================
 
 @app.route("/admin/aprovar")
-@requer_autenticacao
-def aprovar():
+@admin_auth
+def approve():
 
-    ip = request.args.get("ip", "").strip()
+    ip = request.args.get(
+        "ip",
+        ""
+    ).strip()
 
-    if ip_valido(ip):
+    if valid_ip(ip):
 
         IPS_APROVADOS.add(ip)
 
@@ -592,42 +488,38 @@ def aprovar():
             None
         )
 
-        salvar_json(
-            ARQUIVO_APROVADOS,
-            list(IPS_APROVADOS)
+        save_json(
+            APPROVED_FILE,
+            sorted(IPS_APROVADOS)
         )
 
-        salvar_json(
-            ARQUIVO_PENDENTES,
+        save_json(
+            PENDING_FILE,
             DISPOSITIVOS_PENDENTES
         )
 
-        print(
-            f"[ADMIN] IP aprovado: {ip}"
-        )
-
     return redirect(
-        url_for("painel_admin")
+        url_for("admin")
     )
 
 
-# =============================================================
-# APROVAÇÃO MANUAL
-# =============================================================
+# ============================================================
+# APROVAR MANUALMENTE
+# ============================================================
 
 @app.route(
     "/admin/aprovar_manual",
     methods=["POST"]
 )
-@requer_autenticacao
-def aprovar_manual():
+@admin_auth
+def approve_manual():
 
     ip = request.form.get(
         "ip",
         ""
     ).strip()
 
-    if ip_valido(ip):
+    if valid_ip(ip):
 
         IPS_APROVADOS.add(ip)
 
@@ -636,32 +528,28 @@ def aprovar_manual():
             None
         )
 
-        salvar_json(
-            ARQUIVO_APROVADOS,
-            list(IPS_APROVADOS)
+        save_json(
+            APPROVED_FILE,
+            sorted(IPS_APROVADOS)
         )
 
-        salvar_json(
-            ARQUIVO_PENDENTES,
+        save_json(
+            PENDING_FILE,
             DISPOSITIVOS_PENDENTES
         )
 
-        print(
-            f"[ADMIN] IP aprovado manualmente: {ip}"
-        )
-
     return redirect(
-        url_for("painel_admin")
+        url_for("admin")
     )
 
 
-# =============================================================
+# ============================================================
 # REVOGAR
-# =============================================================
+# ============================================================
 
 @app.route("/admin/revogar")
-@requer_autenticacao
-def revogar():
+@admin_auth
+def revoke():
 
     ip = request.args.get(
         "ip",
@@ -672,53 +560,39 @@ def revogar():
 
         IPS_APROVADOS.remove(ip)
 
-        salvar_json(
-            ARQUIVO_APROVADOS,
-            list(IPS_APROVADOS)
-        )
-
-        print(
-            f"[ADMIN] IP revogado: {ip}"
+        save_json(
+            APPROVED_FILE,
+            sorted(IPS_APROVADOS)
         )
 
     return redirect(
-        url_for("painel_admin")
+        url_for("admin")
     )
 
 
-# =============================================================
-# TESTE DA API
-# =============================================================
+# ============================================================
+# ROTA RAIZ
+# ============================================================
 
 @app.route("/")
-def inicio():
+def root():
 
-    return jsonify({
-        "status": "online",
-        "api": "/verAddr",
-        "painel": "/admin"
-    })
+    return Response(status=404)
 
 
-# =============================================================
-# INICIAR SERVIDOR
-# =============================================================
+# ============================================================
+# INICIAR
+# ============================================================
 
 if __name__ == "__main__":
 
-    print("=" * 50)
-    print("SERVIDOR INICIADO")
-    print("API:    /verAddr")
-    print("PAINEL: /admin")
-    print("=" * 50)
+    print(
+        f"Servidor iniciado na porta {PORT}",
+        flush=True
+    )
 
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.environ.get(
-                "PORT",
-                5000
-            )
-        ),
+        port=PORT,
         debug=False
     )
