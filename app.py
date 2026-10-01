@@ -6,8 +6,8 @@ app = Flask(__name__)
 # =============================================================
 # CONFIGURAÇÕES DE SEGURANÇA (ALTERA AQUI OS TEUS DADOS)
 # =============================================================
-ADMIN_USER = "admin"            # O teu nome de utilizador
-ADMIN_PASS = "SuaSenhaSegura123" # A tua palavra-passe secreta
+ADMIN_USER = "daviwld"            # O teu nome de utilizador
+ADMIN_PASS = "luan4520r" # A tua palavra-passe secreta
 # =============================================================
 
 # --- LISTAS DE AUTORIZAÇÃO (Em memória) ---
