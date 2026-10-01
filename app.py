@@ -1,7 +1,7 @@
 import os
 import time
 from threading import Lock
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, Response, request, render_template_string, jsonify
 
 app = Flask(__name__)
 
@@ -9,12 +9,11 @@ LOCK = Lock()
 VISITANTES = {}
 MAX_REGISTROS = 1000
 
-# URL de destino padrão fornecida para a resposta
-URL_VERADDR_PADRAO = "http://2.25.132.119:2223/aalto/false/false/false/false/false/false/false/false/"
+# Resposta JSON idêntica ao padrão aceito nativamente
+JSON_RESPOSTA = '{"status":"sucesso","verAddr":"http://2.25.132.119:2223/aalto/false/false/false/false/false/false/false/false/"}'
 
 def obter_ip_real():
-    """Captura o IP real considerando cabeçalhos de proxy do Render/Cloudflare."""
-    for header in ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP"):
+    for header in ("CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"):
         valor = request.headers.get(header)
         if valor:
             return valor.split(",")[0].strip()
@@ -23,16 +22,8 @@ def obter_ip_real():
 def agora():
     return time.strftime("%d/%m/%Y %H:%M:%S")
 
-@app.after_request
-def aplicar_cors_e_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    return response
-
 @app.before_request
 def registrar_acesso():
-    # Não registra acessos ao painel admin
     if request.path.startswith("/admin"):
         return None
 
@@ -56,23 +47,17 @@ def registrar_acesso():
     return None
 
 # -------------------------------------------------------------
-# ROTA PÚBLICA PARA O JOGO (/verAddr)
-# Responde sempre HTTP 200 com JSON limpo para evitar Erro 2
+# ROTA CRÍTICA PARA O JOGO (/verAddr)
 # -------------------------------------------------------------
 @app.route("/verAddr", methods=["GET", "POST", "OPTIONS"])
 def gateway_ver_addr():
-    if request.method == "OPTIONS":
-        return "", 200
-
-    # Retorno estruturado no formato JSON esperado pelo parser de rede
-    resposta = {
-        "status": "sucesso",
-        "code": 200,
-        "verAddr": URL_VERADDR_PADRAO,
-        "ip": obter_ip_real()
-    }
-    
-    return jsonify(resposta), 200
+    # Retorna resposta JSON bruta para evitar falhas de parseamento no cliente
+    res = Response(JSON_RESPOSTA, status=200, mimetype="application/json")
+    res.headers["Access-Control-Allow-Origin"] = "*"
+    res.headers["Access-Control-Allow-Headers"] = "*"
+    res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    res.headers["Content-Type"] = "application/json; charset=utf-8"
+    return res
 
 # -------------------------------------------------------------
 # PAINEL ADMINISTRATIVO (/admin)
